@@ -1,124 +1,184 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// World state: the chef, items on counters/stations, plates, station timers.
+// An "item" is { ing, state, id } or a { plate, contents: [...] } object.
+// Station slots hold at most one item each.
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import { TILE } from './config.js';
+import { MAP, SOURCE_TILE, TILE_KIND } from './kitchenMap.js';
+import { STATES, TUNING } from './config.js';
 
-export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
-export const EVENT_OVER = 4;
+export let uid = 0;
+export const nextId = () => ++uid;
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
-
-export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
-
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
-    player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+export class World {
+  constructor(level) {
+    this.level = level;
+    this.chef = { x: 7.5 * TILE, y: 8.5 * TILE, dir: 0, held: null }; // pixel center
+    // Items sitting on top of a tile, keyed "col,row".
+    this.slots = new Map();
+    // Per-station progress, keyed "col,row".
+    this.progress = new Map(); // { ticks, target, kind }
+    this.score = 0;
+    this.lives = TUNING.lives;
+    this.combo = 0;
+    this.elapsed = 0;
+    this.paused = false;
+    this.over = false;
+    this.banner = null; // { text, ticks }
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
+  tileAt(col, row) {
+    if (row < 0 || row >= MAP.length) return '#';
+    const line = MAP[row];
+    return col < 0 || col >= line.length ? '#' : line[col];
+  }
+
+  key(col, row) { return col + ',' + row; }
+
+  itemAt(col, row) { return this.slots.get(this.key(col, row)) ?? null; }
+
+  placeItem(col, row, item) { this.slots.set(this.key(col, row), item); }
+
+  takeItem(col, row) {
+    const k = this.key(col, row);
+    const item = this.slots.get(k) ?? null;
+    this.slots.delete(k);
+    this.progress.delete(k);
+    return item;
+  }
+
+  // Interactable tile in front of the chef (based on facing), else the one underfoot-adjacent.
+  facingTile() {
+    const cx = Math.floor(this.chef.x / TILE);
+    const cy = Math.floor(this.chef.y / TILE);
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    for (const [dx, dy] of dirs) {
+      const t = this.tileAt(cx + dx, cy + dy);
+      if (TILE_KIND[t] && TILE_KIND[t] !== 'wall') return { col: cx + dx, row: cy + dy, kind: TILE_KIND[t], ch: t };
+    }
     return null;
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
-  }
+  // Take from a source tile, or put down/take from stations. Returns a message.
+  interact(orderBoard, plates, sfx) {
+    const spot = this.facingTile();
+    if (!spot) return;
+    const { col, row, kind, ch } = spot;
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
-  }
-
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
-    let events = 0;
-    state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
-
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
-    if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
-
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
-    }
-
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
-      }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
+    if (kind === 'counter' || kind === 'rack' || kind === 'pass' || kind === 'board' || kind === 'pan') {
+      const there = this.itemAt(col, row);
+      if (this.chef.held) {
+        // Rack turns held goods into a clean plate when empty-handed items are put? No:
+        // rack gives plates. Putting a plate rack item down is not allowed.
+        if (there) {
+          // Swap
+          this.placeItem(col, row, this.chef.held);
+          this.chef.held = there;
+          sfx.swap();
+          return;
         }
+        if (kind === 'pass') { this.serve(spot, orderBoard, sfx); return; }
+        if (kind === 'pan' && this.chef.held.state === STATES.COOK) {
+          // cooked items cannot go back into the pan
+          this.flash('Cooked food stays out of the pan!');
+          sfx.deny();
+          return;
+        }
+        this.placeItem(col, row, this.chef.held);
+        this.chef.held = null;
+        if (kind === 'pan') {
+          this.progress.set(this.key(col, row), { ticks: 0, target: TUNING.cookTicks, kind: 'cook' });
+          sfx.sizzle();
+        }
+        sfx.put();
+        return;
+      }
+      // empty hands: pick up
+      if (there) {
+        this.chef.held = this.takeItem(col, row);
+        sfx.pick();
+        return;
+      }
+      if (kind === 'rack') {
+        this.chef.held = plates.newPlate();
+        sfx.pick();
+        return;
+      }
+      if (SOURCE_TILE[ch]) {
+        this.chef.held = { id: nextId(), ing: SOURCE_TILE[ch], state: STATES.RAW };
+        sfx.pick();
+        return;
       }
     }
-    return events;
+    sfx.deny();
   }
 
-  reset();
-  return { state, reset, step };
+  // Drop held item on the nearest free counter (Q key).
+  dropHeld() {
+    if (!this.chef.held) return;
+    const cx = Math.floor(this.chef.x / TILE);
+    const cy = Math.floor(this.chef.y / TILE);
+    for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [0, 0]]) {
+      const ch = this.tileAt(cx + dx, cy + dy);
+      const kind = TILE_KIND[ch];
+      if ((kind === 'counter' || kind === 'board') && !this.itemAt(cx + dx, cy + dy)) {
+        if (kind === 'board' && this.chef.held.state === STATES.COOK) continue;
+        this.placeItem(cx + dx, cy + dy, this.chef.held);
+        if (kind === 'board' && this.chef.held.state === STATES.RAW) {
+          this.progress.set(this.key(cx + dx, cy + dy), { ticks: 0, target: TUNING.chopTicks, kind: 'chop' });
+        }
+        this.chef.held = null;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Try to serve the held plate at the pass.
+  serve(spot, orderBoard, sfx) {
+    const plate = this.chef.held;
+    if (!plate || !plate.plate) { this.flash('Bring a plate to the pass!'); sfx.deny(); return; }
+    const result = orderBoard.judge(plate.contents, this.elapsed);
+    if (result.ok) {
+      this.score += result.points + (this.combo > 1 ? this.combo * 10 : 0);
+      this.combo += 1;
+      this.flash(`Served ${result.name}! +${result.points}${this.combo > 1 ? ` (combo x${this.combo})` : ''}`);
+      sfx.serve();
+    } else if (result.reason === 'wrong') {
+      this.combo = 0;
+      this.lives -= 1;
+      this.flash(`Wrong dish! -1 life`);
+      sfx.wrong();
+    } else {
+      sfx.deny();
+    }
+    this.chef.held = null;
+    if (this.lives <= 0) this.over = true;
+  }
+
+  flash(text) { this.banner = { text, ticks: 110 }; }
+
+  // Advance chopping/cooking timers, burn check.
+  update(plates) {
+    if (this.paused || this.over) return;
+    this.elapsed += 1;
+    if (this.banner && --this.banner.ticks <= 0) this.banner = null;
+
+    for (const [k, p] of this.progress) {
+      p.ticks += 1;
+      const [col, row] = k.split(',').map(Number);
+      const item = this.itemAt(col, row);
+      if (!item) { this.progress.delete(k); continue; }
+      if (p.kind === 'chop' && p.ticks >= p.target) {
+        item.state = STATES.CHOP;
+        this.progress.delete(k);
+      } else if (p.kind === 'cook' && p.ticks >= p.target && item.state !== STATES.COOK) {
+        item.state = STATES.COOK;
+      } else if (p.kind === 'cook' && item.state === STATES.COOK && p.ticks >= TUNING.burnTicks) {
+        // burnt: item is destroyed
+        this.takeItem(col, row);
+        this.flash('Burnt! In the bin it goes.');
+        plates.dirtySmoke?.();
+      }
+    }
+  }
 }
