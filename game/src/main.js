@@ -141,8 +141,18 @@ function update(dt) {
   }
 
   if (input.consumeInteract()) {
+    const before = world.chef.held;
     world.interact(board, rack, sfx);
-    // putting an item on a plate held by the chef
+    // When the chef walks up holding a plate, an interact on an ingredient tile
+    // first picks the ingredient up (replacing the plate in the world's logic),
+    // so catch that case: put the picked ingredient on the plate instead and
+    // give the plate back.
+    if (before?.plate && world.chef.held && !world.chef.held.plate) {
+      before.contents.push(`${world.chef.held.ing}:${world.chef.held.state}`);
+      world.chef.held = before;
+      sfx.put();
+    }
+    // Also stack items from a counter tile onto a held plate in one press.
     if (world.chef.held?.plate) {
       const near = world.facingTile();
       if (near) {
